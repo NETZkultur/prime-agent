@@ -2614,6 +2614,13 @@ export class DaemonSupervisor {
 			}
 			await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 			this.broadcastHeartbeatsChanged();
+			// A replaced worker process loses all in-memory runtime state (fresh
+			// IPython kernel, loaded extensions). Attached clients must be able to
+			// detect that their session context died and was respawned (#1417,
+			// #1615, INC-0092), so report the respawn instead of resuming silently.
+			if (existing) {
+				this.broadcastWorkerRespawned(worker, "worker_recovery");
+			}
 			return worker;
 		} catch (error) {
 			if (isSupervisorGenerationStale(error)) {
@@ -5339,6 +5346,23 @@ export class DaemonSupervisor {
 	private broadcastHeartbeatsChanged(): void {
 		for (const client of this.clients) {
 			this.write(client, { type: "heartbeats_changed" });
+		}
+	}
+
+	private broadcastWorkerRespawned(worker: ResidentWorker, reason: string): void {
+		this.log(
+			`Respawned session worker ${worker.descriptor.workerId} for active session ${worker.descriptor.rootActiveSessionId} (${reason})`,
+		);
+		const message: DaemonOutbound = {
+			type: "worker_respawned",
+			...(worker.descriptor.rootSessionId ? { sessionId: worker.descriptor.rootSessionId } : {}),
+			activeSessionId: worker.descriptor.rootActiveSessionId,
+			workerId: worker.descriptor.workerId,
+			reason,
+			respawnedAt: new Date().toISOString(),
+		};
+		for (const client of this.clients) {
+			this.write(client, message);
 		}
 	}
 

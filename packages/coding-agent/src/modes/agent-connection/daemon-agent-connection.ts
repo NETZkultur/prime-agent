@@ -1560,6 +1560,17 @@ export class DaemonAgentConnection implements AgentConnection {
 			await this.emit({ type: "heartbeats_changed" });
 			return;
 		}
+		if (message.type === "worker_respawned") {
+			await this.emit({
+				type: "worker_respawned",
+				...(message.sessionId === undefined ? undefined : { sessionId: message.sessionId }),
+				activeSessionId: message.activeSessionId,
+				workerId: message.workerId,
+				reason: message.reason,
+				respawnedAt: message.respawnedAt,
+			});
+			return;
+		}
 		if (!this.isMessageForActiveSession(message)) {
 			return;
 		}

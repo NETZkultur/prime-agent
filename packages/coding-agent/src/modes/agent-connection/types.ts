@@ -620,6 +620,19 @@ export type AgentConnectionEvent =
 	| { type: "extension_error"; extensionPath: string; event: string; error: string }
 	| { type: "connection_status"; status: "reconnecting" | "connected"; error?: string }
 	| { type: "heartbeats_changed" }
+	| {
+			type: "worker_respawned";
+			/** Root session id of the respawned worker, when one was adopted from disk. */
+			sessionId?: string;
+			/** Canonical active session id the respawned worker hosts. */
+			activeSessionId: string;
+			/** Id of the worker that was replaced by a new process. */
+			workerId: string;
+			/** Short machine-readable cause of the respawn, e.g. "worker_recovery". */
+			reason: string;
+			/** ISO timestamp taken when the respawned worker became ready. */
+			respawnedAt: string;
+	  }
 	| { type: "closed"; error?: string };
 
 export type AgentConnectionEventListener = (event: AgentConnectionEvent) => void | Promise<void>;

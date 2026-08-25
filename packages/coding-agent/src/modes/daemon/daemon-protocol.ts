@@ -67,8 +67,8 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
 // Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
-export const DAEMON_SCHEMA_REVISION = 22;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-4d515169dc6b";
+export const DAEMON_SCHEMA_REVISION = 23;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-fbe1fd331727";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -946,6 +946,19 @@ export type DaemonOutbound =
 	  }
 	| { type: "daemon_closing"; reason: DaemonClosingReason }
 	| { type: "heartbeats_changed" }
+	| {
+			type: "worker_respawned";
+			/** Root session id of the respawned worker, when one was adopted from disk. */
+			sessionId?: string;
+			/** Canonical active session id the respawned worker hosts. */
+			activeSessionId: string;
+			/** Id of the worker that was replaced by a new process. */
+			workerId: string;
+			/** Short machine-readable cause of the respawn, e.g. "worker_recovery". */
+			reason: string;
+			/** ISO timestamp taken when the respawned worker became ready. */
+			respawnedAt: string;
+	  }
 	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent; meta?: DaemonEventMeta }
 	| { type: "side_question_event"; activeSessionId: string; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_status"; activeSessionId: string; recap?: string; meta?: DaemonEventMeta }
@@ -1028,6 +1041,7 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	daemon_hello: LEGACY_DAEMON_COMMAND,
 	daemon_closing: LEGACY_DAEMON_COMMAND,
 	heartbeats_changed: { minProtocol: 7, capability: "heartbeat_catalog" },
+	worker_respawned: { minProtocol: 7, minSchemaRevision: 23 },
 	session_event: LEGACY_DAEMON_COMMAND,
 	side_question_event: LEGACY_DAEMON_COMMAND,
 	session_status: LEGACY_DAEMON_COMMAND,
