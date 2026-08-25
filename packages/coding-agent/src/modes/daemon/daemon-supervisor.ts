@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -1084,6 +1084,16 @@ export class DaemonSupervisor {
 			// the kernel writes the full memory image (655MB measured) even while the thread
 			// spins. JS module names are recoverable via strings(1); frames via gdb/lldb later.
 			// Send SIGABRT first, give the kernel 2s to write the core, then the guaranteed kill.
+			// Measured 2026-08-25: SIGABRT produced NO cores all day because the daemon (and thus
+			// every worker) inherits RLIMIT_CORE=0 from the system default. Node has no setrlimit
+			// API and no preexec hook, but prlimit(1) can raise ANOTHER process's limit from
+			// outside (verified live on this host: prlimit --pid <pid> --core=unlimited works).
+			// Raise the wedged worker's core limit right before the abort so the kernel actually
+			// writes the dump. Best-effort: a missing prlimit or a permission failure logs nothing
+			// and falls through to the abort + kill exactly as before.
+			try {
+				spawnSync("prlimit", ["--pid", String(worker.descriptor.pid), "--core=unlimited:unlimited"], { timeout: 2_000 });
+			} catch {}
 			try {
 				process.kill(worker.descriptor.pid, "SIGABRT");
 			} catch {}
