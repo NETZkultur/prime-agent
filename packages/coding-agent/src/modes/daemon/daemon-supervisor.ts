@@ -126,7 +126,7 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
-import { describeActiveMutations, MutationDrainLatch } from "./mutation-drain-latch.js";
+import { describeActiveMutations, MutationDrainLatch, type MutationDrainSnapshot } from "./mutation-drain-latch.js";
 import { createRlmLedgerRegistrySeedSource, RlmSpawnLedger } from "./rlm-ledger.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot-transcript-cache.js";
@@ -146,6 +146,15 @@ const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // an abandoned prepare leaves the daemon permanently fenced with workers stopped.
 const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
+// A CONNECTED worker whose event loop is wedged never trips the disconnect
+// recovery path and never answers the 5s `list` timeout inside
+// refreshWorkerSummaries, so it stays "ready" forever (INC-0092 fix B). The
+// liveness probe re-uses that request pattern on a schedule and hands a
+// persistently unresponsive worker to the existing recoverWorker respawn path.
+const WORKER_LIVENESS_PROBE_DEFAULT_INTERVAL_MS = 60_000;
+const WORKER_LIVENESS_PROBE_DEFAULT_TIMEOUT_MS = 5_000;
+const WORKER_LIVENESS_PROBE_DEFAULT_RETRIES = 2;
+const WORKER_LIVENESS_PROBE_MAX_RETRIES = 10;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
@@ -542,6 +551,53 @@ export function idleEvictionSweepIntervalMs(idleEvictionMinutes: IdleEvictionMin
 	);
 }
 
+export interface WorkerLivenessProbeConfig {
+	/** Delay between liveness probe sweeps; 0 disables the probe. */
+	intervalMs: number;
+	/** Per-attempt response deadline. */
+	timeoutMs: number;
+	/** Failed attempts retried after the initial one (0 = single attempt). */
+	retries: number;
+}
+
+function parseNonNegativeIntegerEnv(environment: NodeJS.ProcessEnv, name: string, fallback: number): number {
+	const raw = environment[name];
+	if (raw === undefined || raw.trim() === "") {
+		return fallback;
+	}
+	const parsed = Number.parseInt(raw, 10);
+	if (!Number.isFinite(parsed) || parsed < 0) {
+		return fallback;
+	}
+	return parsed;
+}
+
+export function workerLivenessProbeConfig(environment: NodeJS.ProcessEnv = process.env): WorkerLivenessProbeConfig {
+	return {
+		intervalMs: parseNonNegativeIntegerEnv(
+			environment,
+			"PRIME_DAEMON_WORKER_LIVENESS_INTERVAL_MS",
+			WORKER_LIVENESS_PROBE_DEFAULT_INTERVAL_MS,
+		),
+		timeoutMs: Math.max(
+			1,
+			parseNonNegativeIntegerEnv(
+				environment,
+				"PRIME_DAEMON_WORKER_LIVENESS_TIMEOUT_MS",
+				WORKER_LIVENESS_PROBE_DEFAULT_TIMEOUT_MS,
+			),
+		),
+		retries: Math.min(
+			WORKER_LIVENESS_PROBE_MAX_RETRIES,
+			parseNonNegativeIntegerEnv(
+				environment,
+				"PRIME_DAEMON_WORKER_LIVENESS_RETRIES",
+				WORKER_LIVENESS_PROBE_DEFAULT_RETRIES,
+			),
+		),
+	};
+}
+
 function workerSocketPath(supervisorSocketPath: string, workerId: string): string {
 	const key = descriptorKey(supervisorSocketPath);
 	if (process.platform === "win32") {
@@ -653,6 +709,9 @@ export class DaemonSupervisor {
 	private idleEvictionTimer?: ReturnType<typeof setTimeout>;
 	private idleEvictionSweep?: Promise<void>;
 	private idleEvictionFence?: Promise<void>;
+	private workerLivenessProbeTimer?: ReturnType<typeof setTimeout>;
+	private workerLivenessProbeSweep?: Promise<void>;
+	private readonly workerLivenessProbes = new Set<ResidentWorker>();
 
 	constructor(
 		private readonly socketPath: string,
@@ -749,6 +808,7 @@ export class DaemonSupervisor {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
 			this.scheduleIdleEvictionSweep();
+			this.scheduleWorkerLivenessProbe();
 			await this.ownership.updatePhase("owner");
 			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
 			this.markReady();
@@ -803,6 +863,217 @@ export class DaemonSupervisor {
 			this.idleEvictionSweep = sweep;
 		}, delayMs);
 		this.idleEvictionTimer.unref();
+	}
+
+	private clearWorkerLivenessProbeTimer(): void {
+		if (!this.workerLivenessProbeTimer) return;
+		clearTimeout(this.workerLivenessProbeTimer);
+		this.workerLivenessProbeTimer = undefined;
+	}
+
+	private scheduleWorkerLivenessProbe(): void {
+		if (this.shuttingDown || this.workerLivenessProbeTimer || this.workerLivenessProbeSweep) return;
+		const { intervalMs } = workerLivenessProbeConfig();
+		if (intervalMs <= 0) return;
+		this.workerLivenessProbeTimer = setTimeout(() => {
+			this.workerLivenessProbeTimer = undefined;
+			const sweep = this.runWorkerLivenessProbeSweep()
+				.catch((error) => this.log(`Worker liveness probe sweep failed: ${String(error)}`))
+				.finally(() => {
+					if (this.workerLivenessProbeSweep === sweep) this.workerLivenessProbeSweep = undefined;
+					this.scheduleWorkerLivenessProbe();
+				});
+			this.workerLivenessProbeSweep = sweep;
+		}, intervalMs);
+		this.workerLivenessProbeTimer.unref();
+	}
+
+	/**
+	 * Probes every CONNECTED lifecycle=ready worker. A worker that stays
+	 * unresponsive for the whole attempt budget is marked failed and handed to
+	 * the existing recoverWorker path, which replaces the wedged process and
+	 * emits worker_respawned to attached clients. Healthy workers answer the
+	 * probe within the timeout and are never failed by it.
+	 */
+	private async runWorkerLivenessProbeSweep(config = workerLivenessProbeConfig()): Promise<void> {
+		if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+		const candidates = [...this.workers.values()].filter(
+			(worker) => this.shouldProbeWorkerLiveness(worker) && !this.workerLivenessProbes.has(worker),
+		);
+		await Promise.all(candidates.map((worker) => this.probeWorkerLiveness(worker, config)));
+	}
+
+	private shouldProbeWorkerLiveness(worker: ResidentWorker): boolean {
+		return (
+			!this.shuttingDown &&
+			this.updateRestartPhase === undefined &&
+			worker.descriptor.lifecycle === "ready" &&
+			worker.client !== undefined &&
+			!this.isWorkerStopping(worker) &&
+			worker.recovery === undefined &&
+			this.workers.get(worker.descriptor.workerId) === worker
+		);
+	}
+
+	private async probeWorkerLiveness(worker: ResidentWorker, config: WorkerLivenessProbeConfig): Promise<void> {
+		const client = worker.client;
+		if (!client || !this.shouldProbeWorkerLiveness(worker)) return;
+		this.workerLivenessProbes.add(worker);
+		try {
+			const attempts = config.retries + 1;
+			let lastError: Error | undefined;
+			for (let attempt = 1; attempt <= attempts; attempt += 1) {
+				if (!this.shouldProbeWorkerLiveness(worker) || worker.client !== client) {
+					return;
+				}
+				try {
+					// Same lightweight request refreshWorkerSummaries already uses;
+					// a wedged event loop cannot answer it within the budget.
+					const response = await this.requestWorkerLiveness(client, config.timeoutMs);
+					if (response.success) {
+						return;
+					}
+					lastError = new Error(`liveness probe response reported an error: ${response.error}`);
+				} catch (error) {
+					lastError = error instanceof Error ? error : new Error(String(error));
+				}
+			}
+			if (!this.shouldProbeWorkerLiveness(worker) || worker.client !== client) {
+				return;
+			}
+			await this.failWedgedWorker(worker, config, lastError);
+		} finally {
+			this.workerLivenessProbes.delete(worker);
+		}
+	}
+
+	private requestWorkerLiveness(client: DaemonWorkerClient, timeoutMs: number): Promise<DaemonResponse> {
+		// The client-side request timeout already covers a wedged worker; the
+		// supervisor-side deadline guarantees the probe never hangs even when a
+		// client object misbehaves, and keeps the timer from holding the loop.
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(
+				() => reject(new Error(`Timed out waiting for worker liveness response after ${timeoutMs}ms`)),
+				timeoutMs,
+			);
+			timer.unref();
+			client
+				.request({ type: "list" }, timeoutMs)
+				.then(
+					(response) => resolve(response),
+					(error) => reject(error instanceof Error ? error : new Error(String(error))),
+				)
+				.finally(() => clearTimeout(timer));
+		});
+	}
+
+	private async failWedgedWorker(
+		worker: ResidentWorker,
+		config: WorkerLivenessProbeConfig,
+		error: Error | undefined,
+	): Promise<void> {
+		if (!this.shouldProbeWorkerLiveness(worker)) {
+			return;
+		}
+		const attempts = config.retries + 1;
+		const reason = `Liveness probe failed after ${attempts} attempt(s) (timeout ${config.timeoutMs}ms): ${
+			error?.message ?? "worker never responded"
+		}`;
+		this.log(
+			`Connected session worker ${worker.descriptor.workerId} stopped responding; marking failed and recovering: ${reason}`,
+		);
+		// Drop the wedged socket so the worker enters the same recovery path as
+		// a disconnected worker (#1615, INC-0092); recoverWorker then replaces
+		// the process and broadcasts worker_respawned.
+		worker.client?.close();
+		worker.client = undefined;
+		worker.descriptor.lifecycle = "failed";
+		worker.descriptor.lastError = reason;
+		worker.descriptor.lastFailureAt = new Date().toISOString();
+		this.persistWorker(worker);
+		await this.syncAgentPeers().catch(() => undefined);
+		// A live-but-unresponsive process registered to a now-failed worker is
+		// exactly the "could not be safely reclaimed" lockout class: the resume
+		// path refuses to reclaim a failed worker whose process is still alive
+		// without fresh runtime context. Kill the wedged process while its
+		// identity is verified so the registration becomes reclaimable (the
+		// process reads as gone) and a fresh worker can reopen the session file.
+		// An unverifiable identity is never killed; recoverWorker still runs.
+		if (this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId) === "current") {
+			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+		}
+		void this.recoverWorker(worker);
+	}
+
+	private findWorkerForActiveSessionId(activeSessionId: string): ResidentWorker | undefined {
+		return [...this.workers.values()].find(
+			(worker) =>
+				worker.summaries.has(activeSessionId) ||
+				worker.descriptor.rootActiveSessionId === activeSessionId ||
+				[...worker.summaries.values()].some(
+					(summary) => summary.activeSessionId === activeSessionId || summary.sessionId === activeSessionId,
+				),
+		);
+	}
+
+	/**
+	 * Refreshes the worker owning a stale mutation so the diagnosis can name the
+	 * worker-side session state. A worker that is merely awaiting a hung
+	 * provider/model call still answers this refresh; a wedged worker does not,
+	 * which is itself the correlation signal (INC-0092 follow-up diagnosis).
+	 */
+	private async refreshWorkerForMutationDiagnosis(worker: ResidentWorker): Promise<boolean> {
+		if (!worker.client || worker.descriptor.lifecycle !== "ready" || this.isWorkerStopping(worker)) {
+			return false;
+		}
+		try {
+			// Bounded by the 5s list timeout inside refreshWorkerSummaries.
+			await this.refreshWorkerSummaries(worker);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Renders active mutations together with the worker-side session state that
+	 * shows whether each correlates with an open provider/model call: streaming,
+	 * running-tools, activity, and the model in use. Falls back to cached
+	 * summaries when the worker is unresponsive.
+	 */
+	private async describeActiveMutationsWithWorkerState(mutations: readonly MutationDrainSnapshot[]): Promise<string> {
+		if (mutations.length === 0) {
+			return "none";
+		}
+		const sessionIds = [
+			...new Set(mutations.map((mutation) => mutation.sessionId).filter((id): id is string => id !== undefined)),
+		];
+		const diagnosis = new Map<string, { worker: ResidentWorker; responsive: boolean }>();
+		await Promise.all(
+			sessionIds.map(async (sessionId) => {
+				const worker = this.findWorkerForActiveSessionId(sessionId);
+				if (!worker) {
+					return;
+				}
+				diagnosis.set(sessionId, { worker, responsive: await this.refreshWorkerForMutationDiagnosis(worker) });
+			}),
+		);
+		return mutations
+			.map((mutation) => {
+				const entry = mutation.sessionId === undefined ? undefined : diagnosis.get(mutation.sessionId);
+				const summary = entry ? entry.worker.summaries.get(mutation.sessionId as string) : undefined;
+				const workerState = !entry
+					? "workerState=unknown"
+					: `workerState=${entry.responsive ? "responsive" : "unresponsive"}`;
+				const sessionState = summary
+					? `activity=${summary.activity} streaming=${summary.isStreaming} runningTools=${
+							summary.isRunningTools === true
+						} model=${summary.model ? `${summary.model.provider}/${summary.model.id}` : "unknown"}`
+					: "sessionState=unknown";
+				const base = describeActiveMutations([mutation]).slice(1, -1);
+				return `[${base} ${workerState} ${sessionState}]`;
+			})
+			.join(" ");
 	}
 
 	private workerEvictionSnapshot(worker: ResidentWorker): WorkerEvictionSnapshot {
@@ -901,13 +1172,13 @@ export class DaemonSupervisor {
 				// cleanly (see the release comment below). A drain that cannot
 				// complete is diagnosed and bypassed so evictions keep flowing.
 				this.log(
-					`Idle eviction drain incomplete (${error instanceof Error ? error.message : String(error)}); proceeding with active mutations: ${describeActiveMutations(this.mutationDrain.activeMutations())}`,
+					`Idle eviction drain incomplete (${error instanceof Error ? error.message : String(error)}); proceeding with active mutations: ${await this.describeActiveMutationsWithWorkerState(this.mutationDrain.activeMutations())}`,
 				);
 			}
 			const bypassed = this.mutationDrain.activeMutations();
 			if (bypassed.length > 0) {
 				this.log(
-					`Idle eviction proceeding with ${bypassed.length} stale mutation(s) still in flight: ${describeActiveMutations(bypassed)}`,
+					`Idle eviction proceeding with ${bypassed.length} stale mutation(s) still in flight: ${await this.describeActiveMutationsWithWorkerState(bypassed)}`,
 				);
 			}
 			if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
@@ -5413,6 +5684,7 @@ export class DaemonSupervisor {
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
 		this.shuttingDown = true;
 		this.clearIdleEvictionTimer();
+		this.clearWorkerLivenessProbeTimer();
 		await this.idleEvictionSweep?.catch(() => undefined);
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
 			await this.runCleanupStep("signal handler", cleanup);
@@ -5512,6 +5784,7 @@ export class DaemonSupervisor {
 		}
 		this.shuttingDown = true;
 		this.clearIdleEvictionTimer();
+		this.clearWorkerLivenessProbeTimer();
 		await this.idleEvictionSweep?.catch(() => undefined);
 		if (closingReason) {
 			for (const client of this.clients) {
