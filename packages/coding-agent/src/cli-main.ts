@@ -22,6 +22,23 @@ export async function runCli(): Promise<void> {
 	installOwnedSessionWorkerOwnerWatch();
 
 	const args = process.argv.slice(2);
+	// T112 pilot: parallel TS kernel E2E probe (--kernel-probe ts). Purely
+	// additive - handled before any heavy imports so the probe never touches
+	// the production session path.
+	if (args[0] === "--kernel-probe" && args[1] === "ts") {
+		try {
+			const { runTsKernelProbe } = await import("./kernel/ts-kernel-probe.js");
+			const result = await runTsKernelProbe();
+			for (const s of result.steps) {
+				process.stdout.write(`${s.ok ? "PASS" : "FAIL"}  ${s.step}${s.detail ? " | " + s.detail : ""}\n`);
+			}
+			process.stdout.write(`\nkernel probe: ${result.ok ? "ALL GREEN" : "FAILED"}\n`);
+			process.exit(result.ok ? 0 : 1);
+		} catch (probeError) {
+			process.stdout.write(`kernel probe crashed: ${String(probeError)}\n`);
+			process.exit(1);
+		}
+	}
 	const handledByOwnedWorker = await maybeRunOwnedSessionWorkerFrontend(args);
 	if (!handledByOwnedWorker) {
 		if (!isOwnedSessionWorkerProcess()) {
