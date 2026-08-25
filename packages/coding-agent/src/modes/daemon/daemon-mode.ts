@@ -582,8 +582,8 @@ export class AgentDaemon {
 		this.cronScheduler = new AgentCronScheduler(this.cronStore, {
 			runJob: (job) => this.runCronJob(job),
 			beginDispatch: () => {
-				this.mutationDrain.begin();
-				return () => this.mutationDrain.end();
+				const token = this.mutationDrain.begin({ type: "cron_dispatch" });
+				return () => this.mutationDrain.end(token);
 			},
 			onError: (job, error) => {
 				this.log(`Cron job ${job.id} failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -3567,11 +3567,16 @@ export class AgentDaemon {
 					);
 					return;
 				}
-				if (!updateLifecycle) this.mutationDrain.begin();
+				const workerMutationToken = updateLifecycle
+					? undefined
+					: this.mutationDrain.begin({
+							type: workerCommand.type,
+							...(workerCommand.id === undefined ? undefined : { id: workerCommand.id }),
+						});
 				try {
 					await this.handleWorkerCommand(client, workerCommand);
 				} finally {
-					if (!updateLifecycle) this.mutationDrain.end();
+					if (workerMutationToken) this.mutationDrain.end(workerMutationToken);
 				}
 				return;
 			}
@@ -3602,7 +3607,16 @@ export class AgentDaemon {
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
 		}
-		if (mutation) this.mutationDrain.begin();
+		const mutationToken = mutation
+			? this.mutationDrain.begin({
+					type: command.type,
+					...(command.id === undefined ? undefined : { id: command.id }),
+					...(client.id === undefined ? undefined : { clientId: client.id }),
+					...("activeSessionId" in command && command.activeSessionId
+						? { sessionId: command.activeSessionId }
+						: undefined),
+				})
+			: undefined;
 		try {
 			const response = await this.handleCommand(client, command, () => {
 				promptHandlerOwnsAdmission = true;
@@ -3620,7 +3634,7 @@ export class AgentDaemon {
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
 		} finally {
 			if (!promptHandlerOwnsAdmission) clearParsedAdmission();
-			if (mutation) this.mutationDrain.end();
+			if (mutationToken) this.mutationDrain.end(mutationToken);
 		}
 	}
 

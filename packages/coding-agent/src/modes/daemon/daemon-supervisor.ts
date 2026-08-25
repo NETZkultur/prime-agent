@@ -126,7 +126,7 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
-import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import { describeActiveMutations, MutationDrainLatch } from "./mutation-drain-latch.js";
 import { createRlmLedgerRegistrySeedSource, RlmSpawnLedger } from "./rlm-ledger.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot-transcript-cache.js";
@@ -159,6 +159,11 @@ const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
 const IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS = 5 * 60_000;
 const IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS = 60_000;
 const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
+// Per-mutation drain budget for idle eviction: a mutation older than this no
+// longer holds the sweep back. Long-lived mutations (a running turn behind
+// prompt_and_wait or send_message) are reported as bypassed instead of
+// stalling every eviction for their whole lifetime (#1616).
+const IDLE_EVICTION_MUTATION_STALE_MS = 5_000;
 const CHILD_PASSIVATION_PER_WORKER_CAP = 2;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
@@ -871,6 +876,11 @@ export class DaemonSupervisor {
 				}),
 		);
 		if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+		// Nothing to evict means nothing to drain: the drain window exists only to
+		// keep mutations from racing the stops below. Skipping it when no worker is
+		// a candidate keeps a long-running mutation on a busy worker from failing
+		// every sweep (#1616).
+		if (candidates.length === 0) return;
 
 		let releaseFence: () => void = () => {};
 		const fence = new Promise<void>((resolveFence) => {
@@ -878,11 +888,28 @@ export class DaemonSupervisor {
 		});
 		this.idleEvictionFence = fence;
 		try {
-			await this.mutationDrain.waitForDrain(
-				0,
-				AbortSignal.timeout(IDLE_EVICTION_DRAIN_TIMEOUT_MS),
-				"Timed out draining daemon mutations for idle eviction",
-			);
+			try {
+				await this.mutationDrain.waitForDrain(
+					0,
+					AbortSignal.timeout(IDLE_EVICTION_DRAIN_TIMEOUT_MS),
+					"Timed out draining daemon mutations for idle eviction",
+					{ staleAfterMs: IDLE_EVICTION_MUTATION_STALE_MS },
+				);
+			} catch (error) {
+				// The drain is a best-effort quiescence window, not a correctness
+				// fence: a racing mutation either reaches a live worker or fails
+				// cleanly (see the release comment below). A drain that cannot
+				// complete is diagnosed and bypassed so evictions keep flowing.
+				this.log(
+					`Idle eviction drain incomplete (${error instanceof Error ? error.message : String(error)}); proceeding with active mutations: ${describeActiveMutations(this.mutationDrain.activeMutations())}`,
+				);
+			}
+			const bypassed = this.mutationDrain.activeMutations();
+			if (bypassed.length > 0) {
+				this.log(
+					`Idle eviction proceeding with ${bypassed.length} stale mutation(s) still in flight: ${describeActiveMutations(bypassed)}`,
+				);
+			}
 			if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
 			await Promise.all(
 				candidates.map((worker) => this.refreshWorkerSummaries(worker).catch(() => refreshed.delete(worker))),
@@ -1468,7 +1495,16 @@ export class DaemonSupervisor {
 		// Attach is intentionally read-only and is not fence-gated. If eviction wins
 		// the race, attach fails cleanly with "Session worker is not connected" and
 		// the client retries through the saved-session path instead of mutating state.
-		if (mutation) this.mutationDrain.begin();
+		const mutationToken = mutation
+			? this.mutationDrain.begin({
+					type: command.type,
+					...(command.id === undefined ? undefined : { id: command.id }),
+					...(envelopeClientId === undefined ? undefined : { clientId: envelopeClientId }),
+					...("activeSessionId" in command && command.activeSessionId
+						? { sessionId: command.activeSessionId }
+						: undefined),
+				})
+			: undefined;
 		try {
 			const response = await this.handleCommand(client, command, cancellationAdmission);
 			if (response) {
@@ -1491,7 +1527,7 @@ export class DaemonSupervisor {
 			}
 			this.write(client, response);
 		} finally {
-			if (mutation) this.mutationDrain.end();
+			if (mutationToken) this.mutationDrain.end(mutationToken);
 		}
 	}
 
