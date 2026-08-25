@@ -1059,6 +1059,17 @@ export class DaemonSupervisor {
 		// killed, the evidence for why it wedged is unrecoverable from the log
 		// alone (INC-0092 root-cause hunt). Strictly best-effort and synchronous
 		// so the recovery path is never delayed or disturbed.
+		// Ask the wedged worker for a full diagnostic report (JS frames) BEFORE anything else:
+		// the signal is processed between event-loop ticks even while the loop is slow.
+		try {
+			process.kill(worker.descriptor.pid, "SIGUSR2");
+		} catch {}
+		// Bounded synchronous wait so the report write can complete; the supervisor
+		// event loop stalls ~1.5s once per wedge - acceptable for a rare recovery event.
+		try {
+			const sab = new Int32Array(new SharedArrayBuffer(4));
+			Atomics.wait(sab, 0, 0, 1_500);
+		} catch {}
 		captureWedgedWorkerDiagnostics(wedgedWorkerDiagnosticsPath(this.descriptorDir, worker.descriptor.workerId), {
 			workerId: worker.descriptor.workerId,
 			rootActiveSessionId: worker.descriptor.rootActiveSessionId,
@@ -2825,6 +2836,10 @@ export class DaemonSupervisor {
 			[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
 			[SESSION_LEASES_ENABLED_ENV]: "1",
 			[SESSION_LEASE_OWNER_ID_ENV]: rootActiveSessionId,
+			// INC-0092: on wedge, the supervisor signals SIGUSR2 and the worker
+			// writes a full diagnostic report (incl. JS stack frames) into descriptorDir.
+			NODE_OPTIONS: [process.env.NODE_OPTIONS, "--report-on-signal",
+				`--report-directory=${this.descriptorDir}`].filter(Boolean).join(" "),
 		});
 		delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
