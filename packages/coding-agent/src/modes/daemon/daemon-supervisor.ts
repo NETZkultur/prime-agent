@@ -3541,6 +3541,32 @@ export class DaemonSupervisor {
 					}
 					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
 					if (!recoveryCommand || !worker.launchEnv) {
+						// INC-0092 root cause (e002797): a promoted/resident worker (ownerClientId
+						// released, launchEnv cleared) could NEVER self-heal here - it sat "failed"
+						// forever waiting for a client with fresh runtime context, which for a
+						// resident session only arrives if the operator restarts the whole CLI.
+						// Measured live: 70-minute lockout, 504 repeated "Session worker is failed".
+						// The daemon already holds everything a relaunch needs: the descriptor
+						// carries the durable create command (sessionPath), and the supervisor's
+						// own process env is a superset of any client launchEnv. Synthesize a
+						// recovery create command and relaunch through the SAME path a client
+						// relaunch takes, so broadcastWorkerRespawned reattaches every client.
+						const residentSessionPath = worker.descriptor.sessionFile ?? undefined;
+						if (residentSessionPath) {
+							this.log(
+								`Relaunching resident worker ${worker.descriptor.workerId} from durable descriptor (session ${residentSessionPath})`,
+							);
+							const residentRecoveryCommand: DaemonCreateCommand = {
+								type: "create",
+								sessionPath: residentSessionPath,
+							};
+							await this.recoverUncertainWorkerOperations(worker, true);
+							if (this.isWorkerRecoveryCancelled(worker)) {
+								return;
+							}
+							await this.launchWorker(residentRecoveryCommand, worker, undefined);
+							return;
+						}
 						await this.recoverUncertainWorkerOperations(worker, false);
 						worker.descriptor.lifecycle = "failed";
 						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
