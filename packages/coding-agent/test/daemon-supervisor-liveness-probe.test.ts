@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import * as supervisorModule from "../src/modes/daemon/daemon-supervisor.js";
+import { readWedgedWorkerDiagnostics } from "../src/modes/daemon/wedged-worker-diagnostics.js";
 
 const { DaemonSupervisor } = supervisorModule;
 
@@ -39,6 +40,7 @@ interface WorkerFixture {
 }
 
 interface SupervisorInternals {
+	fixtureDescriptorDir: string;
 	workers: Map<string, WorkerFixture>;
 	clients: Set<{ id: string; attachedActiveSessionIds: Set<string> }>;
 	shuttingDown: boolean;
@@ -123,14 +125,19 @@ function makeSupervisor(): SupervisorInternals {
 	tempDirs.push(directory);
 	mkdirSync(directory, { recursive: true });
 	writeFileSync(join(directory, "settings.json"), JSON.stringify({ idleEvictionMinutes: 90 }));
+	const descriptorDir = join(directory, "workers");
+	// The real supervisor creates the descriptor directory in start(); the
+	// fixture drives probe methods directly, so mirror that guarantee here.
+	mkdirSync(descriptorDir, { recursive: true, mode: 0o700 });
 	const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
 		defaultSessionConfig: { agentDir: directory, cwd: directory },
-		descriptorDir: join(directory, "workers"),
+		descriptorDir,
 	}) as unknown as SupervisorInternals;
 	supervisor.recoverWorker = vi.fn(async () => undefined);
 	supervisor.persistWorker = vi.fn();
 	supervisor.syncAgentPeers = vi.fn(async () => undefined);
 	supervisor.log = vi.fn();
+	(supervisor as unknown as { fixtureDescriptorDir: string }).fixtureDescriptorDir = descriptorDir;
 	return supervisor;
 }
 
@@ -186,6 +193,27 @@ describe("daemon supervisor worker liveness probe sweep", () => {
 		expect(supervisor.persistWorker).toHaveBeenCalledWith(wedged);
 		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
 		expect(supervisor.recoverWorker).toHaveBeenCalledWith(wedged);
+	});
+
+	it("records durable wedge diagnostics before handing the worker to recovery", async () => {
+		const supervisor = makeSupervisor();
+		const wedged = makeWorker("wedged", [makeSummary("wedged-root", Date.now())]);
+		wedged.client!.request.mockImplementation(() => new Promise(() => {}));
+		supervisor.workers.set("wedged", wedged);
+
+		await supervisor.runWorkerLivenessProbeSweep(FAST_PROBE);
+
+		expect(supervisor.log).toHaveBeenCalled();
+		const diagnostics = readWedgedWorkerDiagnostics(join(supervisor.fixtureDescriptorDir, "wedged.wedge.jsonl"));
+		expect(diagnostics).toHaveLength(1);
+		const record = diagnostics[0]!;
+		expect(record).toMatchObject({
+			version: 1,
+			workerId: "wedged",
+			rootActiveSessionId: "wedged-descriptor-root",
+			reason: expect.stringMatching(/Liveness probe failed after 3 attempt/),
+		});
+		expect(typeof record.pid).toBe("number");
 	});
 
 	it("does not re-fail or re-recover an already failed worker on the next sweep", async () => {

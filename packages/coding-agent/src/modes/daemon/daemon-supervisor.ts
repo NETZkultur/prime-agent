@@ -130,6 +130,7 @@ import { describeActiveMutations, MutationDrainLatch, type MutationDrainSnapshot
 import { createRlmLedgerRegistrySeedSource, RlmSpawnLedger } from "./rlm-ledger.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot-transcript-cache.js";
+import { captureWedgedWorkerDiagnostics, wedgedWorkerDiagnosticsPath } from "./wedged-worker-diagnostics.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
@@ -1054,6 +1055,16 @@ export class DaemonSupervisor {
 		// identity is verified so the registration becomes reclaimable (the
 		// process reads as gone) and a fresh worker can reopen the session file.
 		// An unverifiable identity is never killed; recoverWorker still runs.
+		// Capture what the wedged process was doing BEFORE it is killed: once
+		// killed, the evidence for why it wedged is unrecoverable from the log
+		// alone (INC-0092 root-cause hunt). Strictly best-effort and synchronous
+		// so the recovery path is never delayed or disturbed.
+		captureWedgedWorkerDiagnostics(wedgedWorkerDiagnosticsPath(this.descriptorDir, worker.descriptor.workerId), {
+			workerId: worker.descriptor.workerId,
+			rootActiveSessionId: worker.descriptor.rootActiveSessionId,
+			pid: worker.descriptor.pid,
+			reason,
+		});
 		if (this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId) === "current") {
 			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
 		}
