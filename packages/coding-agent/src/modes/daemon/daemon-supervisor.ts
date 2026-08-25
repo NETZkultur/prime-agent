@@ -146,6 +146,59 @@ const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // an abandoned prepare leaves the daemon permanently fenced with workers stopped.
 const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
+// A worker that is failed or recovering is not permanently gone: recoverWorker
+// either reconnects it or replaces the process in place, keeping the same
+// ResidentWorker, workerId and rootActiveSessionId. Rejecting a prompt in that
+// window locked the operator out of a session that healed moments later
+// (INC-0092 fix B2). Session-bearing commands therefore park on the recovery
+// instead of failing, bounded in BOTH directions so a permanently dead worker
+// can neither hang callers nor accumulate parked requests without limit.
+const WORKER_RECOVERY_WAIT_TIMEOUT_MS = 45_000;
+const WORKER_RECOVERY_WAIT_POLL_MS = 25;
+/** Backoff before retrying a catch-up that failed while its worker was recovering. */
+const CLIENT_CATCHUP_RETRY_MS = 250;
+/** Bounded parking capacity per worker; beyond it callers fail fast. */
+export const WORKER_RECOVERY_WAIT_MAX_WAITERS = 64;
+/** Catch-up runs in the background per session, so it parks on a shorter budget. */
+const CATCHUP_RECOVERY_WAIT_TIMEOUT_MS = 10_000;
+
+export interface WorkerRecoveryWaitConfig {
+	timeoutMs: number;
+	maxWaiters: number;
+}
+
+/** Test and operator override for the recovery parking budget. */
+export function workerRecoveryWaitConfig(
+	env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+): WorkerRecoveryWaitConfig {
+	const positiveInteger = (raw: string | undefined, fallback: number): number => {
+		if (raw === undefined) return fallback;
+		const parsed = Number(raw);
+		return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+	};
+	return {
+		timeoutMs: positiveInteger(env.PRIME_DAEMON_WORKER_RECOVERY_WAIT_MS, WORKER_RECOVERY_WAIT_TIMEOUT_MS),
+		maxWaiters: positiveInteger(env.PRIME_DAEMON_WORKER_RECOVERY_MAX_WAITERS, WORKER_RECOVERY_WAIT_MAX_WAITERS),
+	};
+}
+
+/**
+ * Commands that carry operator intent for a live session. Only these park on a
+ * recovery; control and teardown commands keep failing fast so shutdown, kill
+ * and status paths never block behind a respawn.
+ */
+const WORKER_RECOVERY_WAITABLE_COMMANDS: ReadonlySet<string> = new Set([
+	"prompt",
+	"prompt_and_wait",
+	"steer",
+	"follow_up",
+	"append_custom_message",
+	"restore_next_turn",
+	"resume_queue",
+	"execute_bash",
+	"execute_bash_and_wait",
+	"send_message",
+]);
 // A CONNECTED worker whose event loop is wedged never trips the disconnect
 // recovery path and never answers the 5s `list` timeout inside
 // refreshWorkerSummaries, so it stays "ready" forever (INC-0092 fix B). The
@@ -712,6 +765,8 @@ export class DaemonSupervisor {
 	private workerLivenessProbeTimer?: ReturnType<typeof setTimeout>;
 	private workerLivenessProbeSweep?: Promise<void>;
 	private readonly workerLivenessProbes = new Set<ResidentWorker>();
+	/** Commands parked on an in-flight worker recovery, counted per worker so the parking stays bounded. */
+	private readonly workerRecoveryWaiters = new Map<ResidentWorker, number>();
 
 	constructor(
 		private readonly socketPath: string,
@@ -1397,6 +1452,7 @@ export class DaemonSupervisor {
 			}
 			cleaned = true;
 			client.detachInput();
+			this.clearClientCatchupRetry(client);
 			this.sessionInputPauseEpochs.set(client, (this.sessionInputPauseEpochs.get(client) ?? 0) + 1);
 			const ownerClientId = this.protocolClientId(client);
 			void this.releaseClientSessionInputPauses(client, undefined, true).catch((error: unknown) =>
@@ -3813,14 +3869,105 @@ export class DaemonSupervisor {
 	}
 
 	private requireAvailableWorkerClient(worker: ResidentWorker, allowStopping = false): DaemonWorkerClient {
-		if (
-			!worker.client ||
-			worker.descriptor.lifecycle !== "ready" ||
-			(!allowStopping && this.isWorkerStopping(worker))
-		) {
+		if (!this.isWorkerClientAvailable(worker, allowStopping)) {
 			throw new Error(`Session worker is ${this.effectiveWorkerState(worker)}`);
 		}
-		return worker.client;
+		return worker.client as DaemonWorkerClient;
+	}
+
+	/** Exactly the condition requireAvailableWorkerClient enforces, as a predicate. */
+	private isWorkerClientAvailable(worker: ResidentWorker, allowStopping = false): boolean {
+		return (
+			worker.client !== undefined &&
+			worker.descriptor.lifecycle === "ready" &&
+			(allowStopping || !this.isWorkerStopping(worker))
+		);
+	}
+
+	/**
+	 * Park until a failed or recovering worker is usable again, or until the
+	 * budget runs out. A respawn keeps the same ResidentWorker object, so a
+	 * caller that waits here resumes against the NEW worker process without
+	 * re-resolving anything (INC-0092 fix B2).
+	 *
+	 * Bounded on purpose: a deadline so no caller waits forever on a worker that
+	 * never heals, and a waiter cap so a permanently dead worker cannot
+	 * accumulate parked requests. Never waits for a stopping, intentionally
+	 * stopped, unmapped or shutting-down worker - those are terminal, not
+	 * transient, and their callers must keep failing fast.
+	 */
+	private async waitForWorkerRecovery(worker: ResidentWorker, deadlineMs?: number): Promise<void> {
+		if (this.isWorkerClientAvailable(worker)) {
+			return;
+		}
+		const config = workerRecoveryWaitConfig();
+		const budgetMs = deadlineMs ?? config.timeoutMs;
+		if (budgetMs <= 0 || !this.isWorkerRecoveryTransient(worker)) {
+			return;
+		}
+		const parked = this.workerRecoveryWaiters.get(worker) ?? 0;
+		if (parked >= config.maxWaiters) {
+			throw new Error(
+				`Session worker ${worker.descriptor.workerId} is recovering and has too many waiting commands`,
+			);
+		}
+		this.workerRecoveryWaiters.set(worker, parked + 1);
+		try {
+			const deadline = Date.now() + budgetMs;
+			while (Date.now() < deadline) {
+				if (this.isWorkerClientAvailable(worker)) {
+					return;
+				}
+				if (!this.isWorkerRecoveryTransient(worker)) {
+					return;
+				}
+				// Nudge an eligible worker that nobody has handed to recovery yet:
+				// failWedgedWorker awaits syncAgentPeers between marking the worker
+				// failed and calling recoverWorker, so a command can land in that gap.
+				if (this.isWorkerRecoveryEligible(worker)) {
+					void this.recoverWorker(worker).catch(() => undefined);
+				}
+				const remaining = deadline - Date.now();
+				if (remaining <= 0) {
+					return;
+				}
+				const recovery = worker.recovery;
+				await (recovery
+					? Promise.race([
+							recovery.catch(() => undefined),
+							unrefDelay(Math.min(remaining, WORKER_RECOVERY_WAIT_POLL_MS)),
+						])
+					: unrefDelay(Math.min(remaining, WORKER_RECOVERY_WAIT_POLL_MS)));
+			}
+		} finally {
+			const remainingWaiters = (this.workerRecoveryWaiters.get(worker) ?? 1) - 1;
+			if (remainingWaiters > 0) {
+				this.workerRecoveryWaiters.set(worker, remainingWaiters);
+			} else {
+				this.workerRecoveryWaiters.delete(worker);
+			}
+		}
+	}
+
+	/**
+	 * True while the worker is only temporarily unavailable: still registered,
+	 * not stopping, not shutting down, and either recovering already or eligible
+	 * to be recovered. A stopping or unmapped worker is terminal.
+	 */
+	private isWorkerRecoveryTransient(worker: ResidentWorker): boolean {
+		if (
+			this.shuttingDown ||
+			worker.intentionalStop ||
+			worker.descriptor.stopRequestedAt !== undefined ||
+			this.workers.get(worker.descriptor.workerId) !== worker
+		) {
+			return false;
+		}
+		if (worker.recovery !== undefined) {
+			return true;
+		}
+		const lifecycle = worker.descriptor.lifecycle;
+		return lifecycle === "failed" || lifecycle === "recovering" || lifecycle === "starting";
 	}
 
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
@@ -3985,6 +4132,20 @@ export class DaemonSupervisor {
 		command: DaemonCommand,
 		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
 	): Promise<DaemonResponse> {
+		// A wedged worker is marked failed and respawned in place. Without this
+		// wait the prompt that arrives during that window is rejected with
+		// "Session worker is failed" even though the session heals seconds later
+		// (INC-0092 fix B2). Only operator-intent commands park; control and
+		// teardown commands keep failing fast.
+		// The guard keeps the healthy path completely synchronous: entering the
+		// async helper would add a microtask tick to EVERY forwarded command and
+		// perturb ordering that callers and tests rely on.
+		if (
+			!this.isWorkerClientAvailable(worker, command.type === "kill") &&
+			WORKER_RECOVERY_WAITABLE_COMMANDS.has(command.type)
+		) {
+			await this.waitForWorkerRecovery(worker);
+		}
 		const client = this.requireAvailableWorkerClient(worker, command.type === "kill");
 		const response = await client.request(withoutCommandId(command), timeoutMs);
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
@@ -4040,6 +4201,13 @@ export class DaemonSupervisor {
 		}
 		const match = await this.findWorkerForClient(client, command.activeSessionId);
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
+		// A catch-up that lands mid-recovery used to fail here with "Session
+		// worker is failed" and was then dropped from the queue, so the client
+		// never reattached to the respawned worker (INC-0092 fix B1). Park on the
+		// recovery on a short budget instead; a terminal worker still fails fast.
+		if (!this.isWorkerClientAvailable(match.worker)) {
+			await this.waitForWorkerRecovery(match.worker, CATCHUP_RECOVERY_WAIT_TIMEOUT_MS);
+		}
 		this.requireAvailableWorkerClient(match.worker);
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
 		const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
@@ -4970,6 +5138,7 @@ export class DaemonSupervisor {
 		if (client.snapshotStreaming || client.backpressured) {
 			return Promise.resolve();
 		}
+		this.clearClientCatchupRetry(client);
 		const catchup = this.drainClientCatchupQueue(client).finally(() => {
 			if (client.catchupPromise === catchup) {
 				client.catchupPromise = undefined;
@@ -4986,13 +5155,48 @@ export class DaemonSupervisor {
 			!client.backpressured &&
 			client.catchupActiveSessionIds?.size
 		) {
-			await this.drainClientCatchups(client);
+			if ((await this.drainClientCatchups(client)) === "retry-later") {
+				return;
+			}
 		}
 	}
 
-	private async drainClientCatchups(client: DaemonSocketClient): Promise<void> {
-		if (client.socket.destroyed) {
+	private clearClientCatchupRetry(client: DaemonSocketClient): void {
+		if (!client.catchupRetryTimer) {
 			return;
+		}
+		clearTimeout(client.catchupRetryTimer);
+		client.catchupRetryTimer = undefined;
+	}
+
+	/**
+	 * Retry a catch-up that failed while its worker was still recovering. The
+	 * timer is single-flighted per client and unref'd so a pending retry never
+	 * holds the daemon open (INC-0092 fix B1).
+	 */
+	private scheduleClientCatchupRetry(client: DaemonSocketClient): void {
+		if (client.socket.destroyed || client.catchupRetryTimer) {
+			return;
+		}
+		client.catchupRetryTimer = setTimeout(() => {
+			client.catchupRetryTimer = undefined;
+			if (client.socket.destroyed || !client.catchupActiveSessionIds?.size) {
+				return;
+			}
+			if (client.snapshotStreaming || client.backpressured) {
+				this.scheduleClientCatchupRetry(client);
+				return;
+			}
+			void this.catchUpClient(client).catch((error) =>
+				this.log(`Could not retry catch-up for client ${client.id}: ${String(error)}`),
+			);
+		}, CLIENT_CATCHUP_RETRY_MS);
+		client.catchupRetryTimer.unref?.();
+	}
+
+	private async drainClientCatchups(client: DaemonSocketClient): Promise<"drained" | "retry-later"> {
+		if (client.socket.destroyed) {
+			return "drained";
 		}
 		const pending = [...(client.catchupActiveSessionIds ?? [])].map((activeSessionId) => ({
 			activeSessionId,
@@ -5067,13 +5271,28 @@ export class DaemonSupervisor {
 					for (const remaining of pending.slice(index + 1)) {
 						this.queueCatchup(client, remaining.activeSessionId, remaining.purpose);
 					}
-					return;
+					return "retry-later";
 				}
 			} catch (error) {
 				releaseTranscript?.();
 				this.log(`Failed to catch up client ${client.id} for ${activeSessionId}: ${String(error)}`);
+				// A catch-up that failed against a worker which is still recovering
+				// must not be dropped: dropping it stranded the client on a session
+				// that healed moments later (INC-0092 fix B1). Re-queue this and the
+				// still-pending sessions and retry on a timer, the same way the
+				// in-process daemon drain already handles a transient failure.
+				// Terminal failures fall through and are only logged, as before.
+				const worker = this.findWorkerForActiveSessionId(activeSessionId);
+				if (worker && !client.socket.destroyed && this.isWorkerRecoveryTransient(worker)) {
+					for (const remaining of pending.slice(index)) {
+						this.queueCatchup(client, remaining.activeSessionId, remaining.purpose);
+					}
+					this.scheduleClientCatchupRetry(client);
+					return "retry-later";
+				}
 			}
 		}
+		return "drained";
 	}
 
 	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
@@ -5650,6 +5869,43 @@ export class DaemonSupervisor {
 		};
 		for (const client of this.clients) {
 			this.write(client, message);
+		}
+		this.reattachClientsAfterRespawn(worker);
+	}
+
+	/**
+	 * Reattach the clients that were attached to the DEAD worker process.
+	 *
+	 * The respawn keeps the same ResidentWorker and activeSessionIds, so the
+	 * clients stay "attached" to sessions that are now served by a different
+	 * process. Announcing the respawn alone left them stranded: their pending
+	 * catch-up had already failed against the failed worker and was dropped, so
+	 * the operator saw a healthy session they could not use (INC-0092 fix B1).
+	 *
+	 * The snapshots cached from the dead process are stale, so drop them first
+	 * and queue a "replacement" catch-up, which reloads from the new worker.
+	 */
+	private reattachClientsAfterRespawn(worker: ResidentWorker): void {
+		const activeSessionIds = new Set<string>([worker.descriptor.rootActiveSessionId]);
+		for (const [activeSessionId, summary] of worker.summaries) {
+			activeSessionIds.add(activeSessionId);
+			const summaryActiveSessionId = summary.activeSessionId ?? summary.id;
+			if (summaryActiveSessionId) activeSessionIds.add(summaryActiveSessionId);
+		}
+		for (const activeSessionId of activeSessionIds) {
+			this.invalidateWorkerSnapshot(worker, activeSessionId);
+		}
+		for (const client of this.clients) {
+			let queued = false;
+			for (const activeSessionId of activeSessionIds) {
+				if (!client.attachedActiveSessionIds.has(activeSessionId)) continue;
+				this.queueCatchup(client, activeSessionId, "replacement");
+				queued = true;
+			}
+			if (!queued) continue;
+			void this.catchUpClient(client).catch((error) =>
+				this.log(`Failed to reattach client ${client.id} after worker respawn: ${String(error)}`),
+			);
 		}
 	}
 

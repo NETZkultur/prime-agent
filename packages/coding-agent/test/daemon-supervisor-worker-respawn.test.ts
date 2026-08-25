@@ -215,7 +215,10 @@ describe("daemon supervisor worker respawn notification", () => {
 		workerRespawnTestState.forceMissingProcessStartId = true;
 		workerRespawnTestState.fixtureMode = "successful-gate";
 		workerRespawnTestState.gateMarkerPath = markerPath;
-		const clients = new Set([{ id: "client-a" }, { id: "client-b" }]);
+		const clients = new Set([
+			{ id: "client-a", attachedActiveSessionIds: new Set<string>() },
+			{ id: "client-b", attachedActiveSessionIds: new Set<string>() },
+		]);
 		const existing = createExistingLaunchWorker(root, descriptorDir);
 		const { supervisor, write } = makeRespawnHarness(root, descriptorDir, markerPath, clients, existing);
 
@@ -250,7 +253,7 @@ describe("daemon supervisor worker respawn notification", () => {
 		workerRespawnTestState.forceMissingProcessStartId = true;
 		workerRespawnTestState.fixtureMode = "successful-gate";
 		workerRespawnTestState.gateMarkerPath = markerPath;
-		const clients = new Set([{ id: "client-a" }]);
+		const clients = new Set([{ id: "client-a", attachedActiveSessionIds: new Set<string>() }]);
 		const { supervisor, write } = makeRespawnHarness(root, descriptorDir, markerPath, clients);
 
 		const worker = await supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } });
