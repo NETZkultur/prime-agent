@@ -1410,8 +1410,24 @@ export class DaemonSupervisor {
 			}
 			this.scheduleOwnedWorkerCleanupForClient(this.protocolClientId(client));
 		};
-		socket.on("close", cleanup);
-		socket.on("error", cleanup);
+		// The client logs "Daemon connection lost; reconnecting" but the daemon
+		// side never named WHY an accepted connection dropped, so every such
+		// occurrence was undiagnosable from the daemon log alone. Record the
+		// drop and its cause here (INC-0092 follow-up diagnosis).
+		let lastSocketError: Error | undefined;
+		socket.on("close", (hadError) => {
+			this.log(
+				`Daemon client connection ${client.id} closed${hadError ? " after error" : ""}${
+					lastSocketError ? `: ${lastSocketError.message}` : ""
+				}`,
+			);
+			cleanup();
+		});
+		socket.on("error", (error: Error) => {
+			lastSocketError = error;
+			this.log(`Daemon client connection ${client.id} error: ${error.message}`);
+			cleanup();
+		});
 		socket.on("drain", () => {
 			client.backpressured = false;
 			if (!client.snapshotStreaming) {
