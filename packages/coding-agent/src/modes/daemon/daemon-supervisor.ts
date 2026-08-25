@@ -3472,7 +3472,7 @@ export class DaemonSupervisor {
 						observedProcessStartId === worker.descriptor.processStartId;
 					if (processAlive && processIdentityMatches) {
 						try {
-							await this.connectWorker(worker, 1500);
+							await this.connectWorker(worker, 4_000, 3_000);
 							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
 							await this.refreshWorkerSummaries(worker, true);
 							if (this.isWorkerRecoveryCancelled(worker)) {
