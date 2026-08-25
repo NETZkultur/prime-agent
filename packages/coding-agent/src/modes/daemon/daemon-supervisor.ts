@@ -1077,6 +1077,20 @@ export class DaemonSupervisor {
 			reason,
 		});
 		if (this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId) === "current") {
+			// Measured 2026-08-25 (e002777): SIGUSR2/--report-on-signal NEVER reaches a hard-
+			// blocked main thread (the exact INC-0092 wedge profile, state=R in one sync block)
+			// because Node processes signals only on event-loop ticks. SIGABRT with default
+			// disposition has a KERNEL-side core-dump action and needs nothing from the process:
+			// the kernel writes the full memory image (655MB measured) even while the thread
+			// spins. JS module names are recoverable via strings(1); frames via gdb/lldb later.
+			// Send SIGABRT first, give the kernel 2s to write the core, then the guaranteed kill.
+			try {
+				process.kill(worker.descriptor.pid, "SIGABRT");
+			} catch {}
+			try {
+				const sab2 = new Int32Array(new SharedArrayBuffer(4));
+				Atomics.wait(sab2, 0, 0, 2_000);
+			} catch {}
 			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
 		}
 		void this.recoverWorker(worker);
