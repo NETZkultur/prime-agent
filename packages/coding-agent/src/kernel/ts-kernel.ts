@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 /** The worker source runs inside the thread; it owns the persistent namespace. */
 const WORKER_SOURCE = `
 const vm = require("node:vm");
+const { stripTypeScriptTypes } = require("node:module");
 const { parentPort } = require("node:worker_threads");
 
 // Persistent namespace: survives across evaluate() calls within this thread.
@@ -40,7 +41,11 @@ parentPort.on("message", (msg) => {
 		if (msg.type === "eval") {
 			let value;
 			try {
-				value = vm.runInContext(msg.code, ns, { timeout: msg.timeoutMs || 10_000 });
+				// TypeScript support: Node 24 ships amaro-based type stripping natively.
+				// Expressions keep working as before; annotated statements are stripped
+				// to plain JS before they hit the vm context.
+				const js = stripTypeScriptTypes(msg.code, { mode: "strip" });
+				value = vm.runInContext(js, ns, { timeout: msg.timeoutMs || 10_000 });
 			} catch (evalError) {
 				parentPort.postMessage({ type: "result", id: msg.id, ok: false,
 					error: String(evalError && evalError.message || evalError) });

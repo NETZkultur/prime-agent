@@ -40,10 +40,11 @@ export {
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ToolDefinition } from "../extensions/types.js";
 import { createIpythonToolDefinition, type IpythonToolOptions } from "./ipython.js";
+import { createTsKernelToolDefinition } from "./ts-kernel-tool.js";
 
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
-export type ToolName = "ipython";
+export type ToolName = "ipython" | "ts";
 
 export interface ToolsOptions {
 	ipython?: IpythonToolOptions;
@@ -52,5 +53,6 @@ export interface ToolsOptions {
 export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): Record<ToolName, ToolDef> {
 	return {
 		ipython: createIpythonToolDefinition(cwd, options?.ipython),
+		ts: createTsKernelToolDefinition(),
 	};
 }
