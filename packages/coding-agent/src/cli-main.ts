@@ -39,6 +39,7 @@ export async function runCli(): Promise<void> {
 				if (!code) break;
 				try {
 					const r = await kernel.evaluate(code, 5_000);
+					if (r.output) process.stdout.write(r.output + "\n");
 					if (r.ok) process.stdout.write(`=> ${JSON.stringify(r.value)}\n`);
 					else process.stdout.write(`ERROR: ${r.error}\n`);
 				} catch (e) {
@@ -49,6 +50,21 @@ export async function runCli(): Promise<void> {
 			process.exit(0);
 		} catch (replError) {
 			process.stdout.write(`kernel repl crashed: ${String(replError)}\n`);
+			process.exit(1);
+		}
+	}
+	if (args[0] === "--kernel-parity") {
+		// T112 pass 2: cross-kernel parity suite - same task in Python and TS.
+		try {
+			const { runParitySuite } = await import("./kernel/ts-kernel-parity.js");
+			const result = await runParitySuite();
+			for (const r of result.results) {
+				process.stdout.write(`${r.match ? "PASS" : "FAIL"}  ${r.name}${r.detail ? " | " + r.detail : ""}\n`);
+			}
+			process.stdout.write(`\nparity suite: ${result.ok ? "ALL MATCH" : "DRIFT DETECTED"}\n`);
+			process.exit(result.ok ? 0 : 1);
+		} catch (e) {
+			process.stdout.write(`parity suite crashed: ${String(e)}\n`);
 			process.exit(1);
 		}
 	}
