@@ -17,16 +17,52 @@ import { randomUUID } from "node:crypto";
 const WORKER_SOURCE = `
 const vm = require("node:vm");
 const { stripTypeScriptTypes } = require("node:module");
+const { createRequire } = require("node:module");
+const nodeRequire = createRequire(process.cwd() + "/");
 const { parentPort } = require("node:worker_threads");
 
 // Persistent namespace: survives across evaluate() calls within this thread.
-let ns = vm.createContext({ __kernel_version: 1 });
+// require shim: user code inside the vm context can load node builtins
+// (fs, path, crypto, ...) but NOT arbitrary packages - the pilot keeps a
+// builtin allowlist so kernel code cannot silently pull the whole tree.
+const ALLOWED_MODULES = new Set(["fs", "path", "crypto", "os", "util", "url", "querystring",
+	"events", "stream", "string_decoder", "timers", "zlib", "assert", "readline"]);
+function kernelRequire(name) {
+	if (!ALLOWED_MODULES.has(name)) {
+		throw new Error("kernel require allowlist: '" + name + "' is not in the builtin allowlist");
+	}
+	return nodeRequire(name);
+}
 
+// Console capture: buffered per evaluation, returned with the result.
+let captured = [];
+
+function makeCaptureConsole() {
+	const fmt = (...a) => a.map((x) => {
+		try { return typeof x === "string" ? x : JSON.stringify(x); }
+		catch { return String(x); }
+	}).join(" ");
+	return {
+		log: (...a) => { captured.push(fmt(...a)); },
+		info: (...a) => { captured.push("info: " + fmt(...a)); },
+		warn: (...a) => { captured.push("warn: " + fmt(...a)); },
+		error: (...a) => { captured.push("error: " + fmt(...a)); },
+	};
+}
+const kernelConsole = makeCaptureConsole();
+
+let ns = vm.createContext({ __kernel_version: 1, require: kernelRequire, console: kernelConsole });
 function serializeNamespace() {
-	// Structured-clone-safe extraction: JSON round-trip of enumerable entries.
+	// Structured values via JSON; functions preserved by SOURCE (closures are
+	// lost - an honest boundary documented for the pilot) and re-created on
+	// restore via new Function. Marked with a sentinel key.
 	const out = {};
 	for (const [k, v] of Object.entries(ns)) {
-		if (k.startsWith("__kernel")) continue;
+		if (k.startsWith("__kernel") || k === "require") continue;
+		if (typeof v === "function") {
+			out[k] = { __kernel_fn__: v.toString() };
+			continue;
+		}
 		try {
 			out[k] = JSON.parse(JSON.stringify(v ?? null));
 		} catch {
@@ -36,10 +72,27 @@ function serializeNamespace() {
 	return out;
 }
 
+function restoreNamespace(state) {
+	ns = vm.createContext({ __kernel_version: 1, require: kernelRequire, console: kernelConsole });
+	for (const [k, v] of Object.entries(state)) {
+		if (v && typeof v === "object" && typeof v.__kernel_fn__ === "string") {
+			try {
+				// Re-create from source. Parameters/closure variables are gone;
+				// evaluated in the namespace context so globals are reachable.
+				const fn = vm.runInContext("(" + v.__kernel_fn__ + ")", ns);
+				ns[k] = fn;
+			} catch {}
+			continue;
+		}
+		try { ns[k] = JSON.parse(JSON.stringify(v)); } catch { ns[k] = v; }
+	}
+}
+
 parentPort.on("message", (msg) => {
 	try {
 		if (msg.type === "eval") {
 			let value;
+			captured = [];
 			try {
 				// TypeScript support: Node 24 ships amaro-based type stripping natively.
 				// Expressions keep working as before; annotated statements are stripped
@@ -51,13 +104,26 @@ parentPort.on("message", (msg) => {
 					error: String(evalError && evalError.message || evalError) });
 				return;
 			}
+			let serializedValue = null;
+			try {
+				const s = JSON.stringify(value);
+				// functions/undefined serialize to undefined - report them by source/name
+				if (typeof value === "function") {
+					serializedValue = "<function " + (value.name || "anonymous") + ">";
+				} else if (s !== undefined) {
+					serializedValue = JSON.parse(s);
+				}
+			} catch {
+				serializedValue = "<unserializable>";
+			}
 			parentPort.postMessage({ type: "result", id: msg.id, ok: true,
-				value: typeof value === "undefined" ? null : JSON.parse(JSON.stringify(value ?? null)) });
+				value: serializedValue,
+				output: captured.join("\\n") });
 		} else if (msg.type === "snapshot") {
 			parentPort.postMessage({ type: "snapshot", id: msg.id, ok: true,
 				state: serializeNamespace() });
 		} else if (msg.type === "restore") {
-			ns = vm.createContext({ __kernel_version: 1, ...msg.state });
+			restoreNamespace(msg.state);
 			parentPort.postMessage({ type: "restored", id: msg.id, ok: true });
 		}
 	} catch (handlerError) {
@@ -71,6 +137,8 @@ export interface EvalResult {
 	ok: boolean;
 	value?: unknown;
 	error?: string;
+	/** Captured console.log/info/warn/error lines from this evaluation. */
+	output?: string;
 }
 
 export interface Snapshot {

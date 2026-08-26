@@ -41,9 +41,12 @@ export function createTsKernelToolDefinition(): ToolDefinition<typeof tsKernelSc
 			const t0 = Date.now();
 			try {
 				const r = await getSharedKernel().evaluate(params.code, 30_000);
-				const text = r.ok
+				let text = r.ok
 					? `${JSON.stringify(r.value)}`
 					: `Error: ${r.error}`;
+				if (r.output) {
+					text = `${r.output}\n=> ${text}`;
+				}
 				return {
 					content: [{ type: "text", text }],
 					details: { durationMs: Date.now() - t0, ok: r.ok },
