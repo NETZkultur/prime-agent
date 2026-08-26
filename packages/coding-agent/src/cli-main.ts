@@ -25,6 +25,33 @@ export async function runCli(): Promise<void> {
 	// T112 pilot: parallel TS kernel E2E probe (--kernel-probe ts). Purely
 	// additive - handled before any heavy imports so the probe never touches
 	// the production session path.
+	if (args[0] === "--kernel-repl" && args[1] === "ts") {
+		// T112: interactive single-line REPL against the parallel TS kernel.
+		// Type a JS expression per line; empty line or EOF exits.
+		try {
+			const { TsKernel } = await import("./kernel/ts-kernel.js");
+			const kernel = new TsKernel();
+			process.stdout.write("ts-kernel ready - type JS expressions, empty line to exit\n");
+			const readline = await import("node:readline");
+			const rl = readline.createInterface({ input: process.stdin });
+			for await (const line of rl) {
+				const code = line.trim();
+				if (!code) break;
+				try {
+					const r = await kernel.evaluate(code, 5_000);
+					if (r.ok) process.stdout.write(`=> ${JSON.stringify(r.value)}\n`);
+					else process.stdout.write(`ERROR: ${r.error}\n`);
+				} catch (e) {
+					process.stdout.write(`KERNEL: ${e instanceof Error ? e.message : String(e)}\n`);
+				}
+			}
+			await kernel.dispose();
+			process.exit(0);
+		} catch (replError) {
+			process.stdout.write(`kernel repl crashed: ${String(replError)}\n`);
+			process.exit(1);
+		}
+	}
 	if (args[0] === "--kernel-probe" && args[1] === "ts") {
 		try {
 			const { runTsKernelProbe } = await import("./kernel/ts-kernel-probe.js");
