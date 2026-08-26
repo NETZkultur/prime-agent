@@ -234,8 +234,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const allowedToolNames = options.allowedToolNames ?? options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const includeGoals = options.includeGoals ?? (options.tools !== undefined || options.noTools !== "all");
+	// T112 parallel kernels: both builtins start active by default - the TS
+	// kernel must come up with the session WITHOUT any parameter (operator
+	// directive 2026-08-26), so the hardcoded ["ipython"] default becomes
+	// ["ipython", "ts"].
 	const initialActiveToolNames: string[] =
-		options.initialActiveToolNames ?? (options.tools ? [...options.tools] : options.noTools ? [] : ["ipython"]);
+		options.initialActiveToolNames
+			?? (options.tools ? [...options.tools] : options.noTools ? [] : ["ipython", "ts"]);
 
 	let agent: Agent;
 

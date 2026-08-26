@@ -9,6 +9,7 @@
  */
 import { Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.js";
+import { writeFileSync } from "node:fs";
 import { TsKernel } from "../../kernel/ts-kernel.js";
 
 const tsKernelSchema = Type.Object({
@@ -35,6 +36,12 @@ function getSharedKernel(): TsKernel {
 getSharedKernel();
 
 export function createTsKernelToolDefinition(): ToolDefinition<typeof tsKernelSchema> {
+	try {
+		writeFileSync(
+			"/opt/infra-struktur-stack/agent-work/inc0092-wedge-profiles/ts-tool-created.marker",
+			new Date().toISOString(),
+		);
+	} catch {}
 	return {
 		name: "ts",
 		label: "ts",
