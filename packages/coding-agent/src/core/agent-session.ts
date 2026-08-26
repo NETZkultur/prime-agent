@@ -8868,12 +8868,6 @@ export class AgentSession {
 			});
 		}
 		this._toolDefinitions = definitionRegistry;
-		try {
-			writeFileSync(
-				"/opt/infra-struktur-stack/agent-work/inc0092-wedge-profiles/tool-registry-dump.json",
-				JSON.stringify([...definitionRegistry.keys()]),
-			);
-		} catch {}
 		this._toolPromptSnippets = new Map(
 			Array.from(definitionRegistry.values())
 				.map(({ definition }) => {
@@ -8933,12 +8927,6 @@ export class AgentSession {
 		}
 
 		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
-		try {
-			writeFileSync(
-				"/opt/infra-struktur-stack/agent-work/inc0092-wedge-profiles/active-tools-dump.json",
-				JSON.stringify({ next: [...new Set(nextActiveToolNames)], active: this.getActiveToolNames() }),
-			);
-		} catch {}
 	}
 
 	private _buildRuntime(options: {
