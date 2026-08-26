@@ -28,6 +28,12 @@ function getSharedKernel(): TsKernel {
 	return sharedKernel;
 }
 
+// Operator directive (2026-08-26): the parallel kernel must START WITH the
+// session - no CLI parameter, no first-call latency. Tool registration
+// happens once per session, so warming here means the worker thread is live
+// before the first user turn.
+getSharedKernel();
+
 export function createTsKernelToolDefinition(): ToolDefinition<typeof tsKernelSchema> {
 	return {
 		name: "ts",
